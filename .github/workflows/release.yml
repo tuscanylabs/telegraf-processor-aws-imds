@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    # Sequence of patterns matched against refs/tags
+    tags:
+      - 'v[0-9]+.*'
+
+jobs:
+  create_release:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Create release
+        id: create_release
+        uses: actions/create-release@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+  release_assets:
+    name: Release assets
+    needs: create_release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: ['linux', 'darwin']
+        goarch: ['amd64', 'arm64']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.19
+
+      - name: Build
+        run: go build -o aws-imds -v cmd/main.go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+
+      - name: Upload release assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create_Release.outputs.upload_url }}
+
+          # this is how it will be named on the release page. put whatever name
+          # you like. remember that they need to be different for each platform.
+          # you can change any build matrix parameters
+          asset_name: aws-imds-${{ matrix.goos }}-${{ matrix.goarch }}
+
+          # the path to the file you want to upload
+          asset_path: ./aws-imds
+
+          # we upload binary files
+          asset_content_type: application/octet-stream
