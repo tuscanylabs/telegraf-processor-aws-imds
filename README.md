@@ -16,8 +16,8 @@ $ go build -o aws-imds cmd/main.go
 ```
 * You should be able to call this from telegraf now using execd
 ```
-[[processors.aws_imds]]
-  command = ["/path/to/aws-imds", "-poll_interval 1m"]
+[[processors.execd]]
+  command = ["/path/to/aws-imds", "-config /path/to/config"]
   signal = "none"
 ```
 This self-contained plugin is based on the documentations of [Execd Go Shim](https://github.com/influxdata/telegraf/blob/effe112473a6bd8991ef8c12e293353c92f1d538/plugins/common/shim/README.md)

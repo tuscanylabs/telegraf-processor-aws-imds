@@ -81,9 +81,6 @@ func (r *AwsIMDSProcessor) Init() error {
 		return errors.New("no allowed metadata tags specified in configuration")
 	}
 
-	// Create a cache with a default expiration time of 5 minutes, and which
-	// purges expired items every 10 minutes.
-	//
 	// Cache will prevent hammering of the IMDS url which can result in throttling and unnecessary HTTP traffic which
 	// may be detected by instrumentation tools such as Pixie
 	r.cache = cache.New(
