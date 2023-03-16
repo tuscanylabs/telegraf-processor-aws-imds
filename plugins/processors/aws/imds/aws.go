@@ -128,8 +128,6 @@ func (r *AwsIMDSProcessor) Lookup(tag string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.Timeout))
 	defer cancel()
 
-	r.Log.Infof("Getting information for tag: %s", tag)
-
 	// check if the value is cached
 	r.rwLock.RLock()
 	result, found := r.cache.Get(tag)
