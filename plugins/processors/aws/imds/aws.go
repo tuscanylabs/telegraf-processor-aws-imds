@@ -6,8 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/coocood/freecache"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
@@ -15,7 +16,6 @@ import (
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/common/parallel"
 	"github.com/influxdata/telegraf/plugins/processors"
-	"github.com/patrickmn/go-cache"
 )
 
 //go:embed sample.conf
@@ -24,23 +24,29 @@ var sampleConfig string
 type AwsIMDSProcessor struct {
 	ImdsTags         []string        `toml:"imds_tags"`
 	Timeout          config.Duration `toml:"timeout"`
+	CacheTTL         config.Duration `toml:"cache_ttl"`
 	Ordered          bool            `toml:"ordered"`
 	MaxParallelCalls int             `toml:"max_parallel_calls"`
-	CacheTTL         int             `toml:"cache_ttl"`
 	Log              telegraf.Logger `toml:"-"`
-	imdsClient       *imds.Client
-	imdsTagsMap      map[string]struct{}
-	parallel         parallel.Parallel
-	instanceID       string
-	cache            *cache.Cache
-	rwLock           sync.RWMutex
+	TagCacheSize     int             `toml:"tag_cache_size"`
+	LogCacheStats    bool            `toml:"log_cache_stats"`
+
+	tagCache *freecache.Cache
+
+	imdsClient          *imds.Client
+	imdsTagsMap         map[string]struct{}
+	parallel            parallel.Parallel
+	instanceID          string
+	cancelCleanupWorker context.CancelFunc
 }
 
 const (
 	DefaultMaxOrderedQueueSize = 10_000
 	DefaultMaxParallelCalls    = 10
 	DefaultTimeout             = 10 * time.Second
-	DefaultCacheTTL            = 24
+	DefaultCacheTTL            = 0 * time.Hour
+	DefaultCacheSize           = 1000
+	DefaultLogCacheStats       = false
 )
 
 var allowedImdsTags = map[string]struct{}{
@@ -68,8 +74,34 @@ func (r *AwsIMDSProcessor) Add(metric telegraf.Metric, _ telegraf.Accumulator) e
 	return nil
 }
 
+func (r *AwsIMDSProcessor) logCacheStatistics(ctx context.Context) {
+	if r.tagCache == nil {
+		return
+	}
+
+	ticker := time.NewTicker(30 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.Log.Debugf("cache: size=%d hit=%d miss=%d full=%d\n",
+				r.tagCache.EntryCount(),
+				r.tagCache.HitCount(),
+				r.tagCache.MissCount(),
+				r.tagCache.EvacuateCount(),
+			)
+			r.tagCache.ResetStatistics()
+		}
+	}
+}
+
 func (r *AwsIMDSProcessor) Init() error {
 	r.Log.Debug("Initializing AWS IMDS Processor")
+	if len(r.ImdsTags) == 0 {
+		return errors.New("no tags specified in configuration")
+	}
 
 	for _, tag := range r.ImdsTags {
 		if len(tag) == 0 || !isIMDSTagAllowed(tag) {
@@ -81,17 +113,22 @@ func (r *AwsIMDSProcessor) Init() error {
 		return errors.New("no allowed metadata tags specified in configuration")
 	}
 
-	// Cache will prevent hammering of the IMDS url which can result in throttling and unnecessary HTTP traffic which
-	// may be detected by instrumentation tools such as Pixie
-	r.cache = cache.New(
-		time.Duration(r.CacheTTL)*time.Hour,
-		time.Duration(r.CacheTTL)*time.Hour,
-	)
-
 	return nil
 }
 
 func (r *AwsIMDSProcessor) Start(acc telegraf.Accumulator) error {
+	r.tagCache = freecache.NewCache(r.TagCacheSize)
+	if r.LogCacheStats {
+		ctx, cancel := context.WithCancel(context.Background())
+		r.cancelCleanupWorker = cancel
+		go r.logCacheStatistics(ctx)
+	}
+
+	r.Log.Debugf("cache: size=%d\n", r.TagCacheSize)
+	if r.CacheTTL > 0 {
+		r.Log.Debugf("cache timeout: seconds=%d\n", int(time.Duration(r.CacheTTL).Seconds()))
+	}
+
 	ctx := context.Background()
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -122,53 +159,56 @@ func (r *AwsIMDSProcessor) Stop() {
 	if r.parallel != nil {
 		r.parallel.Stop()
 	}
+	r.cancelCleanupWorker()
 }
 
-func (r *AwsIMDSProcessor) Lookup(tag string) (string, error) {
+func (r *AwsIMDSProcessor) LookupIMDSTags(metric telegraf.Metric) telegraf.Metric {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.Timeout))
 	defer cancel()
 
-	// check if the value is cached
-	r.rwLock.RLock()
-	result, found := r.cache.Get(tag)
-	if found {
-		defer r.rwLock.RUnlock()
-		// cache is valid
-		return result.(string), nil
+	var tagsNotFound []string
+
+	for tag := range r.imdsTagsMap {
+		val, err := r.tagCache.Get([]byte(tag))
+		if err != nil {
+			tagsNotFound = append(tagsNotFound, tag)
+		} else {
+			metric.AddTag(tag, string(val))
+		}
 	}
-	r.rwLock.RUnlock()
 
-	r.Log.Infof("Cache miss for tag: %s", tag)
+	if len(tagsNotFound) == 0 {
+		return metric
+	}
 
-	r.rwLock.Lock()
-	defer r.rwLock.Unlock()
 	iido, err := r.imdsClient.GetInstanceIdentityDocument(
 		ctx,
 		&imds.GetInstanceIdentityDocumentInput{},
 	)
+
 	if err != nil {
-		return "", err
+		r.Log.Errorf("Error when calling GetInstanceIdentityDocument: %v", err)
+		return metric
 	}
-	v := getTagFromInstanceIdentityDocument(iido, tag)
-	if v != "" {
-		r.cache.Set(tag, v, cache.DefaultExpiration)
+
+	for _, tag := range tagsNotFound {
+		if v := getTagFromInstanceIdentityDocument(iido, tag); v != "" {
+			metric.AddTag(tag, v)
+			expiration := int(time.Duration(r.CacheTTL).Seconds())
+			err = r.tagCache.Set([]byte(tag), []byte(v), expiration)
+			if err != nil {
+				r.Log.Errorf("Error when setting IMDS tag cache value: %v", err)
+			}
+		}
 	}
-	return v, nil
+
+	return metric
 }
 
 func (r *AwsIMDSProcessor) asyncAdd(metric telegraf.Metric) []telegraf.Metric {
+	// Add IMDS Instance Identity Document tags.
 	if len(r.imdsTagsMap) > 0 {
-		for tag := range r.imdsTagsMap {
-			result, err := r.Lookup(tag)
-			if err != nil {
-				r.Log.Errorf("Error when looking up: %v", err)
-				continue
-			}
-			if result == "" {
-
-			}
-			metric.AddTag(tag, result)
-		}
+		metric = r.LookupIMDSTags(metric)
 	}
 
 	return []telegraf.Metric{metric}
@@ -183,9 +223,10 @@ func init() {
 func newAwsIMDSProcessor() *AwsIMDSProcessor {
 	return &AwsIMDSProcessor{
 		MaxParallelCalls: DefaultMaxParallelCalls,
+		TagCacheSize:     DefaultCacheSize,
 		Timeout:          config.Duration(DefaultTimeout),
+		CacheTTL:         config.Duration(DefaultCacheTTL),
 		imdsTagsMap:      make(map[string]struct{}),
-		CacheTTL:         DefaultCacheTTL,
 	}
 }
 
